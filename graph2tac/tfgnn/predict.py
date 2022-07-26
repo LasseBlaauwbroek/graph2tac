@@ -26,6 +26,7 @@ class Inference:
         - `evaluate`: returns whether the inference is correct or not
     """
     value: float
+    graph_constants: GraphConstants
     numpy: Callable[[], np.ndarray]
     evaluate: Callable[[int, tf.Tensor, tf.Tensor], bool]
 
@@ -36,6 +37,7 @@ class TacticInference(Inference):
     Container class for a single base tactic inference for a given proof-state.
     """
     value: float
+    graph_constants: GraphConstants
     tactic_id: int
 
     def numpy(self) -> np.ndarray:
@@ -43,6 +45,14 @@ class TacticInference(Inference):
 
     def evaluate(self, tactic_id: int, local_arguments: tf.Tensor, global_arguments: tf.Tensor) -> bool:
         return tactic_id == self.tactic_id
+
+    def __str__(self):
+        tactic_string = self.graph_constants.tactic_index_to_string[self.tactic_id].decode()
+
+        result = f"""\
+  prob: {np.exp(self.value):f}
+tactic: {tactic_string}"""
+        return result
 
 
 @dataclass
@@ -115,6 +125,9 @@ class PredictOutput:
     def evaluate(self, action: Tuple) -> bool:
         """
         Evaluate an action in tuple format.
+
+        @param action: an action as a tuple of the form (tactic_id, arguments_array)
+        @return: True / False according to whether the action is present among the predictions
         """
         (loader_graph, root, context_node_ids) = self.state
         local_context_length = tf.shape(context_node_ids, out_type=tf.int64)[0]
