@@ -112,30 +112,6 @@ class DataServerDataset:
                                                                   ragged=True)
         #self._label_tokenizer.adapt(graph_constants.label_to_names)
 
-    def proofstates(self, label, shuffle) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
-        """
-        Returns a pair of proof-state datasets for train and validation.
-
-        @param shuffle: whether to shuffle the resulting datasets
-        @return: a dataset of (GraphTensor, label) pairs
-        """
-
-        # get proof-states
-        proofstate_dataset = tf.data.Dataset.from_generator(
-            lambda: self._proofstates_generator(label, shuffle),
-            output_signature=proofstate_graph_spec
-        )
-
-        # filter out proof-states with term arguments
-        if self.exclude_not_faithful:
-            proofstate_dataset = proofstate_dataset.filter(lambda proofstate_graph: tf.reduce_all(proofstate_graph.context['faithful'] == 1))
-
-        # filter out proof-states with `None` arguments
-        if self.exclude_none_arguments:
-            proofstate_dataset = proofstate_dataset.filter(self._no_none_arguments)
-
-        return proofstate_dataset
-
     def definitions(self, label, shuffle) -> tf.data.Dataset:
         """
         Returns the definition dataset.
@@ -272,16 +248,162 @@ class DataServerDataset:
         return DataServerDataset._make_graph_tensor(defn.graph, context)
 
 
+
+    def proofstates(self, label, shuffle) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+        """
+        Returns a pair of proof-state datasets for train and validation.
+
+        @param shuffle: whether to shuffle the resulting datasets
+        @return: a dataset of (GraphTensor, label) pairs
+        """
+
+        # get proof-states
+        proofstate_dataset = tf.data.Dataset.from_generator(
+            lambda: self._proofstates_generator(label, shuffle),
+            output_signature=self.proofstate_data_spec
+        )
+
+        return proofstate_dataset.map(self._make_proofstate_graph_tensor, num_parallel_calls=tf.data.AUTOTUNE)
+
+
+    def proofstates2(self, label, shuffle) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+        """
+        Returns a pair of proof-state datasets for train and validation.
+
+        @param shuffle: whether to shuffle the resulting datasets
+        @return: a dataset of (GraphTensor, label) pairs
+        """
+
+        # get proof-states
+        proofstate_dataset = tf.data.Dataset.from_generator(
+            lambda: self._proofstates_generator2(label, shuffle),
+            output_signature=proofstate_graph_spec
+        )
+
+        return proofstate_dataset
+
+
     def _proofstates_generator(self, label, shuffle):
+        indices = self.data_server.datapoint_indices(label)
+        if shuffle: random.shuffle(indices)
+        for i in indices:
+            loader_proofstate = self.data_server.datapoint_graph(i)
+            yield self._loader_to_proofstate_data(loader_proofstate)
+
+    def _proofstates_generator2(self, label, shuffle):
         indices = self.data_server.datapoint_indices(label)
         if shuffle: random.shuffle(indices)
         for i in indices:
             loader_proofstate = self.data_server.datapoint_graph(i)
             yield self._loader_to_proofstate_graph_tensor(loader_proofstate)
 
-    def _definitions_generator(self, label, shuffle):
-        indices = self.data_server.def_cluster_indices(label)
-        if shuffle: random.shuffle(indices)
-        for i in indices:
-            loader_proofstate = self.data_server.def_cluster_subgraph(i)
-            yield self._loader_to_definition_graph_tensor(loader_proofstate)
+    @staticmethod
+    def _loader_to_proofstate_data(loader_data: tuple[LoaderProofstate, LoaderAction, int]) -> tuple:
+        """Convert loader proofstate and action format to corresponding format for proofstate_data_spec"""
+        state, action, id = loader_data
+        # state
+        graph = state.graph
+        graph_tuple = (graph.nodes, graph.edges, graph.edge_labels, graph.edge_offsets)
+        context_tuple = (state.context.local_context, state.context.global_context)
+        metadata_tuple = (state.metadata.name, state.metadata.step, state.metadata.is_faithful)
+        state_tuple = (graph_tuple, state.root, context_tuple, metadata_tuple)
+
+        # action
+        action_tuple = (action.tactic_id, action.args)
+
+        return (state_tuple, action_tuple, id)
+
+    @classmethod
+    def _make_proofstate_graph_tensor(cls,
+                                      state: Tuple,
+                                      action: Tuple,
+                                      graph_id: tf.Tensor) -> tfgnn.GraphTensor:
+        """
+        Converts the data loader's proof-state representation into a TF-GNN compatible GraphTensor.
+
+        @param state: the tuple containing tf.Tensor objects for the graph structure
+        @param action: the tuple containing tf.Tensor objects for the tactic and arguments
+        @param graph_id: the id of the graph
+        @return: a GraphTensor object that is compatible with the `proofstate_graph_spec` in `graph_schema.py`
+        """
+        loader_graph, root, context, proofstate_info = state
+        context_node_ids, available_global_context = context
+        node_labels, edges, edge_labels, _ = loader_graph
+        sources = edges[:, 0]
+        targets = edges[:, 1]
+        proofstate_name, proofstate_step, proofstate_faithful = proofstate_info
+
+        bare_graph_tensor = cls._make_bare_graph_tensor(node_labels, sources, targets, edge_labels)
+
+        local_context_length = tf.shape(context_node_ids, out_type=tf.int64)[0]
+
+        tactic_id, tactic_args = action
+        local_arguments, global_arguments = cls._split_action_arguments(tactic_args, local_context_length)
+
+        context = tfgnn.Context.from_fields(features={
+            'tactic': tf.expand_dims(tactic_id, axis=0),
+            'local_context_ids': tf.RaggedTensor.from_tensor(tensor=tf.expand_dims(context_node_ids, axis=0),
+                                                             row_splits_dtype=tf.int32),
+            'global_context_ids': tf.RaggedTensor.from_tensor(tensor=tf.expand_dims(available_global_context, axis=0),
+                                                              row_splits_dtype=tf.int32),
+            'local_arguments': tf.RaggedTensor.from_tensor(tensor=tf.expand_dims(local_arguments, axis=0),
+                                                           row_splits_dtype=tf.int32),
+            'global_arguments': tf.RaggedTensor.from_tensor(tensor=tf.expand_dims(global_arguments, axis=0),
+                                                            row_splits_dtype=tf.int32),
+            'graph_id': tf.expand_dims(graph_id, axis=0),
+            'name': tf.expand_dims(proofstate_name, axis=0),
+            'step': tf.expand_dims(proofstate_step, axis=0),
+            'faithful': tf.expand_dims(proofstate_faithful, axis=0)
+        })
+
+        return tfgnn.GraphTensor.from_pieces(node_sets=bare_graph_tensor.node_sets,
+                                             edge_sets=bare_graph_tensor.edge_sets,
+                                             context=context)
+
+    @staticmethod
+    def _make_bare_graph_tensor(node_labels: tf.Tensor,
+                                sources: tf.Tensor,
+                                targets: tf.Tensor,
+                                edge_labels: tf.Tensor
+                                ) -> tfgnn.GraphTensor:
+        """
+        Converts the data loader's graph representation into a TF-GNN compatible GraphTensor.
+
+        @param node_labels: tf.Tensor of node labels (dtype=tf.int64)
+        @param sources: tf.Tensor of edge sources (dtype=tf.int32)
+        @param targets: tf.Tensor of edge targets (dtype=tf.int32)
+        @param edge_labels: tf.Tensor of edge labels (dtype=tf.int64)
+        @return: a GraphTensor object that is compatible with the `bare_graph_spec` in `graph_schema.py`
+        """
+        node_set = tfgnn.NodeSet.from_fields(features={'node_label': node_labels},
+                                             sizes=tf.shape(node_labels))
+
+        adjacency = tfgnn.Adjacency.from_indices(source=('node', sources),
+                                                 target=('node', targets))
+
+        edge_set = tfgnn.EdgeSet.from_fields(features={'edge_label': edge_labels},
+                                             sizes=tf.shape(edge_labels),
+                                             adjacency=adjacency)
+
+        return tfgnn.GraphTensor.from_pieces(node_sets={'node': node_set}, edge_sets={'edge': edge_set})
+
+
+    @staticmethod
+    def _split_action_arguments(arguments_array: tf.Tensor, local_context_length: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Convert an action's arguments from loader format into the corresponding TF-GNN format.
+
+        @param arguments_array: the argument array, as returned by the DataServer
+        @param local_context_length: the size of the local context in the proofstate
+        @return: a pair with a tf.Tensor for the local arguments and a tf.Tensor for the global arguments
+        """
+        is_global_argument, argument_ids = tf.unstack(arguments_array, axis=1)
+
+        # there can still be local arguments that are None
+        is_valid_local_argument = tf.where(is_global_argument == 0, argument_ids, int(1e9)) < local_context_length
+        local_arguments = tf.where(is_valid_local_argument, argument_ids, -1)
+
+        # global arguments go from 0 to node_label_num-base_node_label_num
+        global_arguments = tf.where(is_global_argument == 1, argument_ids, -1)
+
+        return local_arguments, global_arguments

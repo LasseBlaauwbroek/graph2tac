@@ -299,58 +299,48 @@ class Trainer:
         @param batch_size: the global batch size to use
         @return: the training history
         """
-        # compile the training model
-        self.train_model.compile(loss=self._loss(),
-                                 loss_weights=self._loss_weights(),
-                                 optimizer=self.optimizer,
-                                 metrics=self.prediction_task.metrics())
-
         # get training data
-        train_proofstates = self.dataset.proofstates(TRAIN, True)
-        valid_proofstates = self.dataset.proofstates(VALID, False)
-        if self.definition_task:
-            definitions = self.dataset.definitions(TRAIN, False)
-        else:
-            definitions = None
+        # train_proofstates = self.dataset.proofstates(TRAIN, True)
 
-        train_proofstates = (train_proofstates
-            .apply(lambda dataset: self._prepare_dataset(dataset, definitions))
-            .batch(batch_size)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-        valid_proofstates = (valid_proofstates
-            .apply(lambda dataset: self._prepare_dataset(dataset, definitions))
-            .batch(batch_size)
-            .prefetch(tf.data.AUTOTUNE)
-        )
+        import time
 
-        # prepare callbacks
-        callbacks = self._callbacks()
-        if self.log_dir is not None:
-            tensorboard_callback = ExtendedTensorBoard(log_dir=self.log_dir,
-                                                       write_graph=False,
-                                                       write_steps_per_second=True,
-                                                       update_freq='epoch',
-                                                       run_counter=self.run_counter)
-            callbacks.append(tensorboard_callback)
+        start = time.time()
+        count = 0
+        print("start run tf.dataset without batching")
+        for i in self.dataset.proofstates(TRAIN, True):
+            count += 1
+        print("end run")
+        end = time.time()
+        print(end - start)
 
-            # logs for this run
-            tensorboard_callback.log_run(trainer_config=self.get_config(),
-                                         dataset_stats={},
-                                         run_config={
-                                             'total_epochs': total_epochs,
-                                             'batch-size': batch_size,
-                                         }
-                                         )
 
-        # run fit
-        history = self.train_model.fit(train_proofstates,
-                                       validation_data=valid_proofstates,
-                                       initial_epoch=self.trained_epochs.numpy(),
-                                       epochs=total_epochs,
-                                       callbacks=callbacks)
-        return history
+        start = time.time()
+        count = 0
+        print("start run tf.dataset with batching")
+        for i in self.dataset.proofstates(TRAIN, True).batch(batch_size):
+            count += 1
+        print("end run")
+        end = time.time()
+        print(end - start)
 
+        start = time.time()
+        count = 0
+        print("start run iterator without batching")
+        for i in self.dataset.proofstates2(TRAIN, True):
+            count += 1
+        print("end run")
+        end = time.time()
+        print(end - start)
+
+
+        start = time.time()
+        count = 0
+        print("start run iterator with batching")
+        for i in self.dataset.proofstates2(TRAIN, True).batch(batch_size):
+            count += 1
+        print("end run")
+        end = time.time()
+        print(end - start)
 
 def main():
     parser = argparse.ArgumentParser(description="Train")
